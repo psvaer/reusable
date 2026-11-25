@@ -14,13 +14,16 @@ BEGIN
             1 = Monthly
             2 = Yearly
 
-        TableConfigurationID = 40 is a special rolling-window table:
-            Daily   : first day of the month six months before the
-                      processing month through the processing date.
-            Monthly : 65 completed calendar months ending in the month
-                      immediately before the six-month daily window.
+        Offset is an optional number of granularity periods to move the
+        target MaxDate backwards from the processing date.
 
-        All other tables retain the existing Fixed / Expanding behaviour.
+        For a daily + monthly hierarchy, a positive monthly Offset also
+        defines the daily rolling window: Offset - 1 calendar months.
+        Example: monthly Offset = 7 gives six calendar months of daily
+        partitions, followed by monthly partitions ending in the prior month.
+
+        Existing configurations use Offset = 0 and retain their existing
+        Fixed / Expanding behaviour.
     */
 
     -- Default to the configured business timezone when no date is supplied.
@@ -42,6 +45,8 @@ BEGIN
         ,@PartitioningConfigurationID INT
         ,@PartitionType VARCHAR(50)
         ,@Granularity INT
+        ,@Offset INT
+        ,@MonthlyOffset INT
         ,@NumberOfPartitionsFull INT
         ,@NumberOfPartitionsForIncrementalProcess INT
         ,@MaxDate DATE
@@ -53,13 +58,8 @@ BEGIN
         ,@NewNumberOfPartitionsFull INT
         ,@NewNumberOfPartitionsForIncrementalProcess INT
         ,@RollingDailyStartDate DATE
+        ,@RollingDailyMonths INT
         ,@Msg VARCHAR(500);
-
-    -- Table 40 retention settings. These are deliberately isolated here.
-    DECLARE
-         @SpecialTableConfigurationID INT = 40
-        ,@RollingDailyMonths INT = 6
-        ,@RollingMonthlyPartitions INT = 65;
 
     DECLARE curAASPartitions CURSOR LOCAL FAST_FORWARD
     FOR
@@ -72,6 +72,7 @@ BEGIN
                 ,PartitioningConfigurationID
                 ,LOWER(PartitionType) AS PartitionType
                 ,Granularity
+                ,ISNULL([Offset], 0) AS [Offset]
                 ,NumberOfPartitionsFull
                 ,NumberOfPartitionsForIncrementalProcess
                 ,CAST
@@ -99,6 +100,7 @@ BEGIN
                 ,CAST(MAX(CASE WHEN Granularity = 0 THEN 1 ELSE 0 END) AS BIT) AS HasDaily
                 ,CAST(MAX(CASE WHEN Granularity = 1 THEN 1 ELSE 0 END) AS BIT) AS HasMonthly
                 ,CAST(MAX(CASE WHEN Granularity = 2 THEN 1 ELSE 0 END) AS BIT) AS HasYearly
+                ,MAX(CASE WHEN Granularity = 1 THEN [Offset] END) AS MonthlyOffset
             FROM PartitionConfigurations
             GROUP BY ModelConfigurationID, TableConfigurationID
         )
@@ -108,12 +110,14 @@ BEGIN
             ,PC.PartitioningConfigurationID
             ,PC.PartitionType
             ,PC.Granularity
+            ,PC.[Offset]
             ,PC.NumberOfPartitionsFull
             ,PC.NumberOfPartitionsForIncrementalProcess
             ,PC.MaxDate
             ,CG.HasDaily
             ,CG.HasMonthly
             ,CG.HasYearly
+            ,ISNULL(CG.MonthlyOffset, 0) AS MonthlyOffset
         FROM PartitionConfigurations PC
         INNER JOIN ConfigurationGranularities CG
             ON  CG.ModelConfigurationID = PC.ModelConfigurationID
@@ -135,18 +139,28 @@ BEGIN
             ,@PartitioningConfigurationID
             ,@PartitionType
             ,@Granularity
+            ,@Offset
             ,@NumberOfPartitionsFull
             ,@NumberOfPartitionsForIncrementalProcess
             ,@MaxDate
             ,@HasDaily
             ,@HasMonthly
-            ,@HasYearly;
+            ,@HasYearly
+            ,@MonthlyOffset;
 
         WHILE @@FETCH_STATUS = 0
         BEGIN
             ------------------------------------------------------------
             -- Validate granularity
             ------------------------------------------------------------
+            IF @Offset < 0
+            BEGIN
+                SET @Msg =
+                    'Offset cannot be negative for Partition Config ID : '
+                    + CAST(@PartitioningConfigurationID AS VARCHAR(10));
+                THROW 51000, @Msg, 1;
+            END;
+
             IF @Granularity NOT IN (0, 1, 2)
             BEGIN
                 SET @Msg =
@@ -158,8 +172,8 @@ BEGIN
             END;
 
             ------------------------------------------------------------
-            -- Validate partition type. Table 40 still uses the existing
-            -- Fixed / Expanding values; no new type is introduced.
+            -- Validate partition type. Offset does not introduce a new
+            -- partition type; the existing Fixed / Expanding values remain valid.
             ------------------------------------------------------------
             IF @PartitionType NOT IN ('fixed', 'expanding')
             BEGIN
@@ -176,49 +190,38 @@ BEGIN
             ------------------------------------------------------------
             SET @TargetMaxDate = NULL;
 
-            IF @CurrentTableConfigurationID = @SpecialTableConfigurationID
+            IF @Offset > 0
             BEGIN
-                -- Table 40 deliberately has two adjacent rolling windows.
+                -- A positive Offset explicitly positions this granularity
+                -- relative to the processing date.
                 SET @TargetMaxDate =
                     CASE @Granularity
-                        WHEN 0 THEN @ProcessingDate
-                        WHEN 1 THEN EOMONTH(@ProcessingDate, -(@RollingDailyMonths + 1))
+                        WHEN 0 THEN DATEADD(DAY, -@Offset, @ProcessingDate)
+                        WHEN 1 THEN EOMONTH(@ProcessingDate, -@Offset)
+                        WHEN 2 THEN DATEFROMPARTS(YEAR(@ProcessingDate) - @Offset, 12, 31)
                         ELSE NULL
                     END;
             END
             ELSE
             BEGIN
-                -- Existing hierarchy logic for every other table.
+                -- Offset = 0 retains the existing hierarchy behaviour.
                 IF @Granularity = 0
                 BEGIN
-                    -- Daily owns the current processing date.
                     SET @TargetMaxDate = @ProcessingDate;
                 END
                 ELSE IF @Granularity = 1
                 BEGIN
                     IF @HasDaily = 1
-                    BEGIN
-                        -- Monthly owns completed months when daily exists.
                         SET @TargetMaxDate = EOMONTH(@ProcessingDate, -1);
-                    END
                     ELSE
-                    BEGIN
-                        -- Without daily, monthly owns the current month.
                         SET @TargetMaxDate = EOMONTH(@ProcessingDate);
-                    END;
                 END
                 ELSE IF @Granularity = 2
                 BEGIN
                     IF @HasMonthly = 1
-                    BEGIN
-                        -- Yearly owns completed years when monthly exists.
                         SET @TargetMaxDate = DATEFROMPARTS(YEAR(@ProcessingDate) - 1, 12, 31);
-                    END
                     ELSE
-                    BEGIN
-                        -- Without monthly, yearly owns the current year.
                         SET @TargetMaxDate = DATEFROMPARTS(YEAR(@ProcessingDate), 12, 31);
-                    END;
                 END;
             END;
 
@@ -242,13 +245,8 @@ BEGIN
                 THROW 51000, @Msg, 1;
             END;
 
-            /*
-                For normal tables, retain the original hierarchy validation.
-                Table 40 is intentionally different: its monthly MaxDate is
-                expected to move backwards from the old hierarchy boundary
-                (31-Oct-2026) to the rolling-window boundary (30-Apr-2026).
-            */
-            IF @CurrentTableConfigurationID <> @SpecialTableConfigurationID
+            -- A positive Offset can intentionally move MaxDate backwards.
+            IF @Offset = 0
                AND @MaxDate > @TargetMaxDate
             BEGIN
                 SET @Msg =
@@ -269,17 +267,24 @@ BEGIN
             SET @NewNumberOfPartitionsForIncrementalProcess =
                 @NumberOfPartitionsForIncrementalProcess;
 
-            IF @CurrentTableConfigurationID = @SpecialTableConfigurationID
+            /*
+                Rolling-window handling is metadata-driven:
+                  - A positive Offset keeps the configured partition count
+                    and moves the upper boundary as required.
+                  - For a daily + monthly hierarchy, MonthlyOffset - 1 is
+                    the number of calendar months retained at daily grain.
+                    This keeps the daily and monthly ranges contiguous.
+
+                NumberOfPartitionsFull remains the configured retention count
+                for monthly and other offset-based granularities. Daily count
+                is recalculated because the number of days in six calendar
+                months varies with the processing date.
+            */
+            IF @Offset > 0 OR (@Granularity = 0 AND @MonthlyOffset > 1)
             BEGIN
-                --------------------------------------------------------
-                -- Table 40: fixed rolling windows, independent of the
-                -- current calendar day/month and independent of the
-                -- configured Fixed / Expanding value.
-                --------------------------------------------------------
-                IF @Granularity = 0
+                IF @Granularity = 0 AND @MonthlyOffset > 1
                 BEGIN
-                    -- First day of the month six months before the
-                    -- processing month, through the processing date.
+                    SET @RollingDailyMonths = @MonthlyOffset - 1;
                     SET @RollingDailyStartDate =
                         DATEFROMPARTS
                         (
@@ -290,27 +295,12 @@ BEGIN
 
                     SET @NewNumberOfPartitionsFull =
                         DATEDIFF(DAY, @RollingDailyStartDate, @TargetMaxDate) + 1;
-                END
-                ELSE IF @Granularity = 1
-                BEGIN
-                    -- 65 complete calendar months ending at TargetMaxDate.
-                    SET @NewNumberOfPartitionsFull = @RollingMonthlyPartitions;
-                END
-                ELSE
-                BEGIN
-                    SET @Msg =
-                        'TableConfigurationID 40 supports only Daily (0) '
-                        + 'and Monthly (1) granularities. Partition Config ID : '
-                        + CAST(@PartitioningConfigurationID AS VARCHAR(10));
-                    THROW 51000, @Msg, 1;
                 END;
 
-                -- Keep the configured incremental/hot partition counts (5 daily, 2 monthly).
+                -- Keep the configured incremental partition count unchanged.
                 SET @NewNumberOfPartitionsForIncrementalProcess =
                     @NumberOfPartitionsForIncrementalProcess;
 
-                -- Unlike the original forward-only logic, update when the
-                -- date moves either direction or when the rolling count changes.
                 IF @MaxDate <> @TargetMaxDate
                    OR @NumberOfPartitionsFull <> @NewNumberOfPartitionsFull
                 BEGIN
@@ -334,7 +324,7 @@ BEGIN
             ELSE IF @MaxDate < @TargetMaxDate
             BEGIN
                 --------------------------------------------------------
-                -- Existing behaviour for all tables other than Table 40
+                -- Existing behaviour for configurations without rolling offsets
                 --------------------------------------------------------
                 SET @PeriodsAdvanced =
                     CASE @Granularity
@@ -413,12 +403,14 @@ BEGIN
                 ,@PartitioningConfigurationID
                 ,@PartitionType
                 ,@Granularity
+                ,@Offset
                 ,@NumberOfPartitionsFull
                 ,@NumberOfPartitionsForIncrementalProcess
                 ,@MaxDate
                 ,@HasDaily
                 ,@HasMonthly
-                ,@HasYearly;
+                ,@HasYearly
+            ,@MonthlyOffset;
         END;
 
         CLOSE curAASPartitions;
